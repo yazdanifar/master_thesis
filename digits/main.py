@@ -1,4 +1,10 @@
 import os, sys
+
+from hypnettorch.hnets import ChunkedHMLP, HMLP, StructuredHMLP
+from hypnettorch.utils import hnet_regularizer as hreg
+
+from digits.state_tensor_translator import StateTensorTranslator
+
 sys.path.append('..')
 import argparse
 import os.path as osp
@@ -30,6 +36,13 @@ def lr_scheduler(optimizer, iter_num, max_iter, gamma=10, power=0.75):
         param_group['momentum'] = 0.9
         param_group['nesterov'] = True
     return optimizer
+
+
+def meta_lr_scheduler(optimizer, iter_num, max_iter, gamma=10, power=0.75):
+    decay = (1 + gamma * iter_num / max_iter) ** (-power)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = param_group['lr0'] * decay
+    return decay * args.meta_lr
 
 
 def train_source(train_loader, test_loader, args, task_label):
@@ -678,6 +691,76 @@ def print_args(args):
     return s
 
 
+def phi_loss(task_id, hnet, weights):
+    W_target = torch.cat([w.view(-1) for w in weights])
+    weights_predicted = hnet.forward(cond_id=task_id)
+    W_predicted = torch.cat([w.view(-1) for w in weights_predicted])
+    return (W_target - W_predicted).pow(2).sum()
+
+
+def load_prev_task_weights(hnet, task_id):
+    netF_states, netB_states, netC_states = [], [], []
+    for t in range(task_id):
+        tensors = hnet(cond_id=t)
+        netF_state, netB_state, netC_state = translator.tensor_to_state(tensors)
+        netF_states.append(netF_state)
+        netB_states.append(netB_state)
+        netC_states.append(netC_state)
+
+    return netF_states, netB_states, netC_states
+
+
+def meta_learn_nets(netF, netB, netC, hnet, meta_opt, task_id):
+    phi = translator.states_to_tensor(netF.state_dict(), netB.state_dict(), netC.state_dict())
+    phi = [p.cuda() for p in phi]
+    prev_hnet_theta = [p.detach().clone() for p in hnet.unconditional_params]
+    prev_task_embs = [p.detach().clone() for p in hnet.conditional_params]
+    log_interval = 100
+    eval_interval = 500
+    for e in range(args.meta_epochs):
+        current_lr = meta_lr_scheduler(meta_opt, iter_num=e, max_iter=args.meta_epochs, gamma=args.meta_gamma,
+                                       power=args.meta_power)
+        meta_opt.zero_grad()
+        meta_loss = phi_loss(task_id, hnet, phi)
+        if task_id > 0 and not args.no_replay:
+            meta_loss += hreg.calc_fix_target_reg(hnet, task_id, prev_theta=prev_hnet_theta,
+                                                  prev_task_embs=prev_task_embs, inds_of_out_heads=None,
+                                                  batch_size=-1)
+        meta_loss.backward()
+        meta_opt.step()
+        if e % log_interval == 0 or e == (args.meta_epochs - 1):
+            print(f"task: {task_id}, epoch: {e:4d}, lr: {current_lr:.5f}, meta loss: {meta_loss:,.0f}")
+        if e % eval_interval == 0 or e == (args.meta_epochs - 1):
+            evaluate_over_all_performance(hnet, task_id, args)
+    return phi
+
+
+def evaluate_over_all_performance(hnet, task_id, args):
+    mode = hnet.training
+    hnet.eval()
+    with torch.no_grad():
+        netF_states, netB_states, netC_states = load_prev_task_weights(hnet, task_id + 1)
+    hnet.train(mode)
+
+    log_str = ''
+    if args.eval_scenario in ['both', 'TI']:
+        accs = task_incremental_eval(test_loaders, netF_states, netB_states, netC_states, args)
+        log_str += 'task incremental results:'
+        for t, acc in enumerate(accs):
+            log_str += ' task {}: {:.2f}'.format(t, acc)
+        log_str += '\n'
+
+    if args.eval_scenario in ['both', 'DI']:
+        accs = task_agnostic_eval(test_loaders, netF_states, netB_states, netC_states, args)
+        log_str += 'domain incremental results:'
+        for t, acc in enumerate(accs):
+            log_str += ' task {}: {:.2f}'.format(t, acc)
+
+    args.out_file.write(log_str + '\n')
+    args.out_file.flush()
+    print(log_str)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='SHOT')
     parser.add_argument('--gpu_id', type=str, nargs='?', default='0', help="device id to run")
@@ -700,6 +783,24 @@ if __name__ == "__main__":
     parser.add_argument('--smooth', type=float, default=0.1)
     parser.add_argument('--src_only', action='store_true',
                         help='if specified, only source will be used for all the tasks')
+
+
+
+
+    parser.add_argument('--meta_epochs', type=int, default=5000)
+
+    parser.add_argument('--meta_lr', type=float, default=0.1)
+
+
+    parser.add_argument('--meta_gamma', type=int, default=20)
+    parser.add_argument('--meta_power', type=float, default=1.5, help="meta weight decay")
+
+
+
+    parser.add_argument('--meta_wd', type=float, default=1, help="meta weight decay")
+
+    parser.add_argument('--no_replay', action='store_true', help="don't meta replay")
+    parser.add_argument('--eval_scenario', type=str, default="TI", choices=["both", "TI", "DI"])
     parser.add_argument('--output', type=str, default='ckps_digits')
     parser.add_argument('--exp_name', type=str)
     args = parser.parse_args()
@@ -736,7 +837,19 @@ if __name__ == "__main__":
         torch.save(netC.state_dict(), osp.join(args.output, "0_C.pt"))
     else:
         netF, netB, netC = load_models(0, args)
-    netF_states, netB_states, netC_states = [netF.state_dict()], [netB.state_dict()], [netC.state_dict()]
+
+    translator = StateTensorTranslator(netF.state_dict(), netB.state_dict(), netC.state_dict())
+    hnet = ChunkedHMLP(target_shapes=translator.tensor_shapes(), chunk_size=33300,
+                       chunk_emb_size=64, cond_chunk_embs=True,
+                       cond_in_size=0, layers=[], verbose=True, num_cond_embs=len(args.task_names)).cuda()
+
+    nn.init.normal_(hnet._internal_params[0], 1.0, 0.02)
+    nn.init.zeros_(hnet._internal_params[1])
+
+    meta_opt = optim.Adam(hnet.parameters(), lr=args.meta_lr, weight_decay=args.meta_wd)
+    meta_opt = op_copy(meta_opt)
+    meta_learn_nets(netF, netB, netC, hnet, meta_opt, 0)
+    # exit()
 
     log_str = 'task 1 started'
     args.out_file.write(log_str + '\n')
@@ -753,11 +866,12 @@ if __name__ == "__main__":
     else:
         netF, netB, netC = load_models(1, args)
 
-    netF_states.append(netF.state_dict())
-    netB_states.append(netB.state_dict())
-    netC_states.append(netC.state_dict())
-
+    meta_learn_nets(netF, netB, netC, hnet, meta_opt, 1)
     for task_id in range(2, len(args.task_names)):
+        hnet.eval()
+        with torch.no_grad():
+            netF_states, netB_states, netC_states = load_prev_task_weights(hnet, task_id)
+        hnet.train()
         log_str = 'task {} started'.format(task_id)
         args.out_file.write(log_str + '\n')
         print(log_str)
@@ -776,19 +890,4 @@ if __name__ == "__main__":
             torch.save(netC.state_dict(), osp.join(args.output, "{}_C.pt".format(task_id)))
         else:
             netF, netB, netC = load_models(task_id, args)
-
-        netF_states.append(netF.state_dict())
-        netB_states.append(netB.state_dict())
-        netC_states.append(netC.state_dict())
-
-    accs = task_incremental_eval(test_loaders, netF_states, netB_states, netC_states, args)
-    log_str = 'Task Incremental Results:\n'
-    for acc in accs:
-        log_str += '\t{:.2f}'.format(acc)
-    accs = task_agnostic_eval(test_loaders, netF_states, netB_states, netC_states, args)
-    log_str += '\nTask Agnostic Results:\n'
-    for acc in accs:
-        log_str += '\t{:.2f}'.format(acc)
-    args.out_file.write(log_str + '\n')
-    args.out_file.flush()
-    print(log_str)
+        meta_learn_nets(netF, netB, netC, hnet, meta_opt, task_id)
