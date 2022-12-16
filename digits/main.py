@@ -42,7 +42,7 @@ def meta_lr_scheduler(optimizer, iter_num, max_iter, gamma=10, power=0.75):
     decay = (1 + gamma * iter_num / max_iter) ** (-power)
     for param_group in optimizer.param_groups:
         param_group['lr'] = param_group['lr0'] * decay
-    return decay * args.meta_lr
+    return optimizer
 
 
 def train_source(train_loader, test_loader, args, task_label):
@@ -710,27 +710,40 @@ def load_prev_task_weights(hnet, task_id):
     return netF_states, netB_states, netC_states
 
 
-def meta_learn_nets(netF, netB, netC, hnet, meta_opt, task_id):
+def meta_learn_nets(netF, netB, netC, hnet, task_id):
+
+    meta_opt = optim.Adam(hnet.parameters(), lr=args.meta_lr[task_id], weight_decay=args.meta_wd[task_id])
+    meta_opt = op_copy(meta_opt)
     phi = translator.states_to_tensor(netF.state_dict(), netB.state_dict(), netC.state_dict())
     phi = [p.cuda() for p in phi]
     prev_hnet_theta = [p.detach().clone() for p in hnet.unconditional_params]
     prev_task_embs = [p.detach().clone() for p in hnet.conditional_params]
     log_interval = 100
     eval_interval = 500
-    for e in range(args.meta_epochs):
-        current_lr = meta_lr_scheduler(meta_opt, iter_num=e, max_iter=args.meta_epochs, gamma=args.meta_gamma,
-                                       power=args.meta_power)
+    for e in range(args.meta_epochs[task_id]):
+        meta_lr_scheduler(meta_opt, iter_num=e,
+                                       max_iter=args.meta_epochs[task_id],
+                                       gamma=args.meta_gamma[task_id],
+                                       power=args.meta_power[task_id])
+
         meta_opt.zero_grad()
         meta_loss = phi_loss(task_id, hnet, phi)
         if task_id > 0 and not args.no_replay:
-            meta_loss += hreg.calc_fix_target_reg(hnet, task_id, prev_theta=prev_hnet_theta,
+            replay_loss = args.replay_coeff * hreg.calc_fix_target_reg(hnet, task_id, prev_theta=prev_hnet_theta,
                                                   prev_task_embs=prev_task_embs, inds_of_out_heads=None,
                                                   batch_size=-1)
+            if e % log_interval == 0 or e == (args.meta_epochs[task_id] - 1):
+                print(f"task: {task_id} epoch: {e:4d} meta loss: {meta_loss:,.0f} "
+                      f"replay loss: {replay_loss:,.0f}")
+            meta_loss += replay_loss
+        else:
+            if e % log_interval == 0 or e == (args.meta_epochs[task_id] - 1):
+                print(f"task: {task_id} epoch: {e:4d} meta loss: {meta_loss:,.0f}")
+
         meta_loss.backward()
         meta_opt.step()
-        if e % log_interval == 0 or e == (args.meta_epochs - 1):
-            print(f"task: {task_id}, epoch: {e:4d}, lr: {current_lr:.5f}, meta loss: {meta_loss:,.0f}")
-        if e % eval_interval == 0 or e == (args.meta_epochs - 1):
+
+        if e % eval_interval == 0 or e == (args.meta_epochs[task_id] - 1):
             evaluate_over_all_performance(hnet, task_id, args)
     return phi
 
@@ -787,17 +800,12 @@ if __name__ == "__main__":
 
 
 
-    parser.add_argument('--meta_epochs', type=int, default=5000)
-
-    parser.add_argument('--meta_lr', type=float, default=0.1)
-
-
-    parser.add_argument('--meta_gamma', type=int, default=20)
-    parser.add_argument('--meta_power', type=float, default=1.5, help="meta weight decay")
-
-
-
-    parser.add_argument('--meta_wd', type=float, default=1, help="meta weight decay")
+    parser.add_argument('--meta_epochs', type=int, nargs='+', default=[5000, 5000, 5000, 5000])
+    parser.add_argument('--meta_lr', type=float, nargs='+', default=[0.1, 0.1, 0.1])
+    parser.add_argument('--meta_gamma', type=int, nargs='+', default=[50, 80, 20])
+    parser.add_argument('--meta_power', type=float, nargs='+', default=[.9, 1.5, 1.5])
+    parser.add_argument('--replay_coeff', type=float, default=1)
+    parser.add_argument('--meta_wd', type=float, nargs='+', default=[1, 1, 1], help="meta weight decay")
 
     parser.add_argument('--no_replay', action='store_true', help="don't meta replay")
     parser.add_argument('--eval_scenario', type=str, default="TI", choices=["both", "TI", "DI"])
@@ -839,17 +847,14 @@ if __name__ == "__main__":
         netF, netB, netC = load_models(0, args)
 
     translator = StateTensorTranslator(netF.state_dict(), netB.state_dict(), netC.state_dict())
-    hnet = ChunkedHMLP(target_shapes=translator.tensor_shapes(), chunk_size=33300,
-                       chunk_emb_size=64, cond_chunk_embs=True,
+    hnet = ChunkedHMLP(target_shapes=translator.tensor_shapes(), chunk_size=7000,
+                       chunk_emb_size=100, cond_chunk_embs=True,
                        cond_in_size=0, layers=[], verbose=True, num_cond_embs=len(args.task_names)).cuda()
 
-    nn.init.normal_(hnet._internal_params[0], 1.0, 0.02)
+    nn.init.ones_(hnet._internal_params[0])
     nn.init.zeros_(hnet._internal_params[1])
 
-    meta_opt = optim.Adam(hnet.parameters(), lr=args.meta_lr, weight_decay=args.meta_wd)
-    meta_opt = op_copy(meta_opt)
-    meta_learn_nets(netF, netB, netC, hnet, meta_opt, 0)
-    # exit()
+    meta_learn_nets(netF, netB, netC, hnet, 0)
 
     log_str = 'task 1 started'
     args.out_file.write(log_str + '\n')
@@ -866,7 +871,7 @@ if __name__ == "__main__":
     else:
         netF, netB, netC = load_models(1, args)
 
-    meta_learn_nets(netF, netB, netC, hnet, meta_opt, 1)
+    meta_learn_nets(netF, netB, netC, hnet, 1)
     for task_id in range(2, len(args.task_names)):
         hnet.eval()
         with torch.no_grad():
@@ -890,4 +895,4 @@ if __name__ == "__main__":
             torch.save(netC.state_dict(), osp.join(args.output, "{}_C.pt".format(task_id)))
         else:
             netF, netB, netC = load_models(task_id, args)
-        meta_learn_nets(netF, netB, netC, hnet, meta_opt, task_id)
+        meta_learn_nets(netF, netB, netC, hnet, task_id)
